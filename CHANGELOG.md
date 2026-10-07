@@ -17,6 +17,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Lambda — event source mappings pick up new work at once** — a new SQS message, Kinesis record or DynamoDB stream record now wakes the poller instead of waiting for its idle tick, cutting the delay from send to invocation from 0.75 s to about 4 ms.
 - **IoT — `DescribeCertificate` reports `certificateMode`** — the field was missing from the description. It is now `SNI_ONLY` for a certificate registered with `RegisterCertificateWithoutCA` and `DEFAULT` for the others, as AWS reports it. Contributed by @iot-rocket.
 ### Fixed
 - **Lambda — preserve invocation aliases in runtime context** — `Invoke` retains the requested alias or version in `invoked_function_arn`, while `function_version` remains the resolved published version. Warm workers receive invocation identity per request.
