@@ -520,6 +520,7 @@ def _configure_tls(config, bind_host: str, port: str) -> None:
     elif _running_in_container() and port != "443" and _port_is_bindable(bind_host, 443):
         config.certfile, config.keyfile = _tls.resolve_tls_material()
         config.insecure_bind, config.bind = config.bind, [f"{bind_host}:443"]
+        _tls.issuer_listener = True
     # In-process Lambdas share this container's resolver; Docker ones get extra_hosts.
     if _running_in_container():
         _tls.map_cognito_issuer_hosts()
@@ -3416,6 +3417,9 @@ def main():
             config.bind.remove(f"{bind_host}:443")
             if not config.bind:  # A plain gateway keeps serving without the issuer listener.
                 config.bind, config.insecure_bind, config.certfile = config.insecure_bind, [], None
+                from ministack.core import tls as _tls
+
+                _tls.issuer_listener = False
             logger.warning("Port 443 became unavailable; serving on %s only",
                            config.bind[0])
             asyncio.run(hypercorn_serve(app, config))

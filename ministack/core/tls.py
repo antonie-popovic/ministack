@@ -146,11 +146,13 @@ def map_cognito_issuer_hosts(hosts_path: str = "/etc/hosts") -> None:
         pass
 
 
-def issuer_tls_enabled() -> bool:
-    """Whether the gateway serves the Cognito issuer over TLS: under USE_SSL, or in a container."""
-    from ministack.services.lambda_svc import _running_in_container
+# Set by app._configure_tls while 443 serves the Cognito issuer next to a plain-HTTP gateway.
+issuer_listener = False
 
-    return use_ssl_enabled() or _running_in_container()
+
+def issuer_tls_enabled() -> bool:
+    """Whether the gateway serves TLS: under USE_SSL, or on the 443 issuer listener."""
+    return use_ssl_enabled() or issuer_listener
 
 
 def trust_gateway_cert(env: dict) -> None:

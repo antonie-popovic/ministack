@@ -347,9 +347,12 @@ def test_java_truststore_carries_our_cert_and_the_public_roots(tmp_path, monkeyp
 def _fresh_tls(tmp_path, monkeypatch):
     import tempfile
 
+    from ministack.core import tls
+
     monkeypatch.setenv("TMPDIR", str(tmp_path))
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     monkeypatch.setenv("USE_SSL", "1")
+    monkeypatch.setattr(tls, "issuer_listener", False)
     monkeypatch.delenv("MINISTACK_SSL_CERT", raising=False)
     monkeypatch.delenv("MINISTACK_SSL_KEY", raising=False)
     for var in ("NODE_EXTRA_CA_CERTS", "AWS_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "SSL_CERT_FILE"):
@@ -456,3 +459,19 @@ def test_issuer_gets_tls_on_443_in_a_container_while_the_gateway_stays_http(tmp_
         assert env["SSL_CERT_FILE"].endswith("ca-bundle.pem")
     else:
         assert (config.insecure_bind, config.bind, config.ssl_enabled, mapped) == ([], ["0.0.0.0:4566"], False, [])
+
+
+def test_trust_gateway_cert_needs_the_issuer_listener_not_a_container(tmp_path, monkeypatch):
+    """Without USE_SSL, only the 443 listener _configure_tls opened makes a process trust the cert."""
+    from ministack.core import tls
+    from ministack.services import lambda_svc
+
+    _fresh_tls(tmp_path, monkeypatch)
+    monkeypatch.delenv("USE_SSL")
+    monkeypatch.setattr(lambda_svc, "_running_in_container", lambda: True)
+    env = {}
+    tls.trust_gateway_cert(env)
+    assert env == {}
+    monkeypatch.setattr(tls, "issuer_listener", True)
+    tls.trust_gateway_cert(env)
+    assert env["SSL_CERT_FILE"].endswith("ca-bundle.pem")
