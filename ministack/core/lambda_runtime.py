@@ -1187,9 +1187,9 @@ class Worker:
         if "AWS_ENDPOINT_URL" not in spawn_env:
             if _tls.use_ssl_enabled():
                 spawn_env["AWS_ENDPOINT_URL"] = f"https://127.0.0.1:{port}"
-                _tls.trust_gateway_cert(spawn_env)
             else:
                 spawn_env["AWS_ENDPOINT_URL"] = f"http://127.0.0.1:{port}"
+        _tls.trust_gateway_cert(spawn_env)
         if "LOCALSTACK_HOSTNAME" in os.environ:
             spawn_env["LOCALSTACK_HOSTNAME"] = os.environ["LOCALSTACK_HOSTNAME"]
         spawn_env.setdefault("LAMBDA_TASK_ROOT", code_dir)

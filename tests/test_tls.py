@@ -342,3 +342,117 @@ def test_java_truststore_carries_our_cert_and_the_public_roots(tmp_path, monkeyp
     subjects = [entry.certificate.subject for entry in loaded.additional_certs]
     assert ours.subject in subjects
     assert len(subjects) > 5
+
+
+def _fresh_tls(tmp_path, monkeypatch):
+    import tempfile
+
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setenv("USE_SSL", "1")
+    monkeypatch.delenv("MINISTACK_SSL_CERT", raising=False)
+    monkeypatch.delenv("MINISTACK_SSL_KEY", raising=False)
+    for var in ("NODE_EXTRA_CA_CERTS", "AWS_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "SSL_CERT_FILE"):
+        monkeypatch.delenv(var, raising=False)
+
+
+def test_generated_cert_is_a_server_certificate_not_a_ca(tmp_path, monkeypatch):
+    """webpki (rustls) refuses a CA certificate presented as the server's, CaUsedAsEndEntity."""
+    from ministack.core import tls
+
+    _fresh_tls(tmp_path, monkeypatch)
+    cert_path, _key = tls.resolve_tls_material()
+    out = subprocess.run(
+        ["openssl", "x509", "-in", cert_path, "-noout", "-ext", "basicConstraints,extendedKeyUsage"],
+        capture_output=True, text=True, check=True).stdout
+    assert "CA:FALSE" in out and "CA:TRUE" not in out
+    assert "TLS Web Server Authentication" in out
+    verify = subprocess.run(["openssl", "verify", "-CAfile", cert_path, cert_path],
+                            capture_output=True, text=True)
+    assert verify.returncode == 0, verify.stdout + verify.stderr
+
+
+def test_cached_ca_certificate_is_regenerated(tmp_path, monkeypatch):
+    from ministack.core import tls
+
+    _fresh_tls(tmp_path, monkeypatch)
+    tls_dir = tmp_path / "ministack-tls"
+    tls_dir.mkdir()
+    names = "".join(f"DNS:{h}," for h in tls._generated_cert_names())
+    subprocess.run([
+        "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+        "-keyout", str(tls_dir / "server.key"), "-out", str(tls_dir / "server.crt"),
+        "-days", "1", "-subj", "/CN=old", "-addext", "basicConstraints=critical,CA:TRUE",
+        "-addext", f"subjectAltName={names}DNS:localhost",
+    ], check=True, capture_output=True)
+    cert, _ = tls.resolve_tls_material()
+    assert "CA:FALSE" in subprocess.run(["openssl", "x509", "-in", cert, "-noout", "-ext", "basicConstraints"],
+                                        capture_output=True, text=True, check=True).stdout
+
+
+def test_trust_gateway_cert_sets_ssl_cert_file(tmp_path, monkeypatch):
+    """OpenSSL, Go, Ruby and rustls-native-certs read SSL_CERT_FILE, not the AWS/requests variables."""
+    from ministack.core import tls
+
+    _fresh_tls(tmp_path, monkeypatch)
+    env = {}
+    tls.trust_gateway_cert(env)
+    assert env["SSL_CERT_FILE"] == env["AWS_CA_BUNDLE"]
+    mine = {"SSL_CERT_FILE": "/opt/mine.pem"}
+    tls.trust_gateway_cert(mine)
+    assert mine["SSL_CERT_FILE"] == "/opt/mine.pem"
+
+
+def test_map_cognito_issuer_hosts_appends_each_missing_host_once(tmp_path):
+    from ministack.core import tls
+
+    hosts = tmp_path / "hosts"
+    first = tls.cognito_idp_hosts()[0]
+    hosts.write_text(f"127.0.0.1 localhost\n127.0.0.1 {first}\n")
+    tls.map_cognito_issuer_hosts(str(hosts))
+    tls.map_cognito_issuer_hosts(str(hosts))
+    lines = hosts.read_text().splitlines()
+    assert lines[0] == "127.0.0.1 localhost"
+    for host in tls.cognito_idp_hosts():
+        assert lines.count(f"127.0.0.1 {host}") == 1
+    tls.map_cognito_issuer_hosts(str(tmp_path / "missing" / "hosts"))
+
+
+def test_provided_runtime_trusts_the_gateway_with_a_function_endpoint(tmp_path, monkeypatch):
+    """A provided.* bootstrap reaches the issuer host whatever endpoint the function names."""
+    from ministack.services import lambda_svc
+
+    _fresh_tls(tmp_path, monkeypatch)
+    config = {"FunctionName": "f", "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:f",
+              "Environment": {"Variables": {"AWS_ENDPOINT_URL": "http://127.0.0.1:4566"}}}
+    env = lambda_svc._provided_worker_env(config, str(tmp_path), 9001)
+    assert env["SSL_CERT_FILE"].endswith("ca-bundle.pem")
+    monkeypatch.delenv("USE_SSL")
+    assert "SSL_CERT_FILE" not in lambda_svc._provided_worker_env(config, str(tmp_path), 9001)
+
+
+@pytest.mark.parametrize("in_container", [True, False])
+def test_issuer_gets_tls_on_443_in_a_container_while_the_gateway_stays_http(tmp_path, monkeypatch, in_container):
+    """A Cognito `iss` is https on 443 whatever the gateway speaks; only a container serves it there."""
+    from hypercorn.config import Config
+
+    from ministack import app
+    from ministack.core import tls
+    from ministack.services import lambda_svc
+
+    _fresh_tls(tmp_path, monkeypatch)
+    monkeypatch.delenv("USE_SSL")
+    monkeypatch.setattr(lambda_svc, "_running_in_container", lambda: in_container)
+    monkeypatch.setattr(app, "_port_is_bindable", lambda host, port: True)
+    mapped = []
+    monkeypatch.setattr(tls, "map_cognito_issuer_hosts", lambda: mapped.append(True))
+    config = Config()
+    config.bind = ["0.0.0.0:4566"]
+    app._configure_tls(config, "0.0.0.0", "4566")
+    if in_container:
+        assert (config.insecure_bind, config.bind, config.ssl_enabled, mapped) == (["0.0.0.0:4566"], ["0.0.0.0:443"], True, [True])
+        env = {}
+        tls.trust_gateway_cert(env)
+        assert env["SSL_CERT_FILE"].endswith("ca-bundle.pem")
+    else:
+        assert (config.insecure_bind, config.bind, config.ssl_enabled, mapped) == ([], ["0.0.0.0:4566"], False, [])

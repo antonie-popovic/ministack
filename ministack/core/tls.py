@@ -119,19 +119,44 @@ def java_truststore_path(cert_path: str) -> "str | None":
 
 
 def _cert_names(cert_path: str, names: "list[str]") -> bool:
-    """Whether the certificate at `cert_path` carries every name in `names` as a SAN."""
+    """Whether the certificate at `cert_path` carries every name in `names` as a SAN and is no CA.
+
+    webpki (rustls) refuses a CA certificate served as the leaf (CaUsedAsEndEntity).
+    """
     try:
         out = subprocess.run(
-            ["openssl", "x509", "-in", cert_path, "-noout", "-ext", "subjectAltName"],
+            ["openssl", "x509", "-in", cert_path, "-noout", "-ext", "subjectAltName,basicConstraints"],
             capture_output=True, text=True, check=False,
         )
     except OSError:
         return True  # No openssl to check with; leave the cached cert alone.
-    return all(f"DNS:{name}" in (out.stdout or "") for name in names)
+    text = out.stdout or ""
+    return all(f"DNS:{name}" in text for name in names) and "CA:TRUE" not in text
+
+
+def map_cognito_issuer_hosts(hosts_path: str = "/etc/hosts") -> None:
+    """Resolve every Cognito issuer host to this container's gateway, for in-process Lambdas."""
+    try:
+        present = open(hosts_path, encoding="utf-8").read().split()
+        missing = [host for host in cognito_idp_hosts() if host not in present]
+        if missing:
+            with open(hosts_path, "a", encoding="utf-8") as hosts:
+                hosts.write("".join(f"127.0.0.1 {host}\n" for host in missing))
+    except OSError:
+        pass
+
+
+def issuer_tls_enabled() -> bool:
+    """Whether the gateway serves the Cognito issuer over TLS: under USE_SSL, or in a container."""
+    from ministack.services.lambda_svc import _running_in_container
+
+    return use_ssl_enabled() or _running_in_container()
 
 
 def trust_gateway_cert(env: dict) -> None:
     """Have a host process trust the gateway's certificate, unless env already names a CA."""
+    if not issuer_tls_enabled():
+        return
     try:
         cert_path, _key_path = resolve_tls_material()
     except SystemExit:
@@ -141,7 +166,7 @@ def trust_gateway_cert(env: dict) -> None:
     env.setdefault("NODE_EXTRA_CA_CERTS", cert_path)
     bundle = ca_bundle_path(cert_path)
     if bundle:
-        for var in ("AWS_CA_BUNDLE", "REQUESTS_CA_BUNDLE"):
+        for var in ("AWS_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "SSL_CERT_FILE"):
             env.setdefault(var, bundle)
 
 
@@ -180,6 +205,9 @@ def resolve_tls_material() -> "tuple[str, str]":
             "-keyout", key_path, "-out", cert_path,
             "-days", "825",
             "-subj", "/CN=ministack-local/O=MiniStack",
+            "-addext", "basicConstraints=critical,CA:FALSE",
+            "-addext", "keyUsage=critical,digitalSignature,keyEncipherment",
+            "-addext", "extendedKeyUsage=serverAuth",
             "-addext",
             "subjectAltName=DNS:localhost,DNS:ministack,"
             + "".join(f"DNS:{host}," for host in _generated_cert_names())

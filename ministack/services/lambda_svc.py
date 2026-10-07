@@ -5343,6 +5343,9 @@ def _provided_worker_env(config: dict, code_dir: str, port: int) -> dict:
             endpoint = _normalize_endpoint_url(hostname)
     if endpoint:
         proc_env["AWS_ENDPOINT_URL"] = endpoint
+    from ministack.core import tls as _tls
+
+    _tls.trust_gateway_cert(proc_env)
     return proc_env
 
 
@@ -5659,6 +5662,8 @@ def _execute_function_local(func: dict, event: dict) -> dict:
                 }
             )
             env.update(execution_credentials(config))
+            from ministack.core import tls as _tls
+
             endpoint = _normalize_endpoint_url(os.environ.get("AWS_ENDPOINT_URL", ""))
             if not endpoint:
                 endpoint = _normalize_endpoint_url(env_vars.get("AWS_ENDPOINT_URL", ""))
@@ -5667,16 +5672,13 @@ def _execute_function_local(func: dict, event: dict) -> dict:
             if not endpoint:
                 # Subprocess runs on the same host as ministack — point it at
                 # ourselves so boto3 calls land back here, not at real AWS.
-                from ministack.core import tls as _tls
-
                 gateway_port = os.environ.get("GATEWAY_PORT", "4566")
                 scheme = "https" if _tls.use_ssl_enabled() else "http"
                 endpoint = f"{scheme}://{_MINISTACK_HOST}:{gateway_port}"
-                if scheme == "https":
-                    _tls.trust_gateway_cert(env)
             if endpoint:
                 env["AWS_ENDPOINT_URL"] = endpoint
             env.update(env_vars)
+            _tls.trust_gateway_cert(env)
             env.update(_durable_env_overlay())
             # X-Ray active tracing — one-shot subprocess, env is per-invocation
             # so a fresh trace ID per call is safe (unlike the pooled RIE).
