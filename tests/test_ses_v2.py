@@ -708,3 +708,56 @@ def test_ses_v2_send_bulk_email_rejects_missing_template_without_recording_sends
     assert status == 404
     assert body["name"] == "NotFoundException"
     assert ses_v2._sent_emails_list() == []
+
+
+def test_ses_v2_dedicated_ip_pool_lifecycle_and_tags(ses_v2):
+    status, _ = _call(ses_v2, "POST", "/v2/email/dedicated-ip-pools",
+                      body={"PoolName": "pool1", "Tags": [{"Key": "k", "Value": "v"}]})
+    assert status == 200
+    status, body = _call(ses_v2, "GET", "/v2/email/dedicated-ip-pools/pool1")
+    assert body == {"DedicatedIpPool": {"PoolName": "pool1", "ScalingMode": "STANDARD"}}
+    status, body = _call(ses_v2, "GET", query={"ResourceArn": [_arn("dedicated-ip-pool", "pool1")]})
+    assert body["Tags"] == [{"Key": "k", "Value": "v"}]
+    status, body = _call(ses_v2, "POST", "/v2/email/dedicated-ip-pools", body={"PoolName": "pool1"})
+    assert (status, body["name"]) == (400, "AlreadyExistsException")
+    assert _call(ses_v2, "DELETE", "/v2/email/dedicated-ip-pools/pool1")[0] == 200
+    status, body = _call(ses_v2, "GET", "/v2/email/dedicated-ip-pools/pool1")
+    assert (status, body["name"]) == (404, "NotFoundException")
+
+
+def test_ses_v2_tenant_lifecycle_resources_and_tags(ses_v2):
+    status, tenant = _call(ses_v2, "POST", "/v2/email/tenants",
+                           body={"TenantName": "t1", "Tags": [{"Key": "a", "Value": "b"}]})
+    assert status == 200
+    assert tenant["TenantArn"] == f"{_arn('tenant', 't1')}/{tenant['TenantId']}"
+    assert tenant["TenantId"].startswith("tn-") and tenant["SendingStatus"] == "ENABLED"
+    assert isinstance(tenant["CreatedTimestamp"], int)
+    status, body = _call(ses_v2, "POST", "/v2/email/tenants", body={"TenantName": "t1"})
+    assert (status, body["name"]) == (400, "AlreadyExistsException")
+
+    assert _call(ses_v2, "POST", body={"ResourceArn": tenant["TenantArn"],
+                                       "Tags": [{"Key": "c", "Value": "d"}]})[0] == 200
+    status, body = _call(ses_v2, "POST", "/v2/email/tenants/get", body={"TenantName": "t1"})
+    assert body["Tenant"]["Tags"] == [{"Key": "a", "Value": "b"}, {"Key": "c", "Value": "d"}]
+
+    _verify(ses_v2, "x@example.com")
+    identity_arn = _arn("identity", "x@example.com")
+    assert _call(ses_v2, "POST", "/v2/email/tenants/resources",
+                 body={"TenantName": "t1", "ResourceArn": identity_arn})[0] == 200
+    status, body = _call(ses_v2, "POST", "/v2/email/tenants/resources",
+                         body={"TenantName": "t1", "ResourceArn": identity_arn})
+    assert (status, body["name"]) == (400, "AlreadyExistsException")
+    status, body = _call(ses_v2, "POST", "/v2/email/tenants/resources",
+                         body={"TenantName": "t1", "ResourceArn": _arn("configuration-set", "missing")})
+    assert (status, body["name"]) == (404, "NotFoundException")
+    status, body = _call(ses_v2, "POST", "/v2/email/tenants/resources/list", body={"TenantName": "t1"})
+    assert body["TenantResources"] == [{"ResourceType": "EMAIL_IDENTITY", "ResourceArn": identity_arn}]
+    status, body = _call(ses_v2, "POST", "/v2/email/tenants/resources/list",
+                         body={"TenantName": "t1", "Filter": {"RESOURCE_TYPE": "EMAIL_TEMPLATE"}})
+    assert body["TenantResources"] == []
+    assert _call(ses_v2, "POST", "/v2/email/tenants/resources/delete",
+                 body={"TenantName": "t1", "ResourceArn": identity_arn})[0] == 200
+
+    assert _call(ses_v2, "POST", "/v2/email/tenants/delete", body={"TenantName": "t1"})[0] == 200
+    status, body = _call(ses_v2, "POST", "/v2/email/tenants/get", body={"TenantName": "t1"})
+    assert (status, body["name"]) == (404, "NotFoundException")

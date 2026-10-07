@@ -1091,3 +1091,57 @@ def test_ses_send_from_an_unverified_sender_is_rejected():
         v1.send_email(Source=unverified, Destination={"ToAddresses": ["to@example.com"]},
                       Message={"Subject": {"Data": "s"}, "Body": {"Text": {"Data": "b"}}})
     assert exc.value.response["Error"]["Code"] == "MessageRejected"
+
+
+def test_ses_receipt_rule_sets_and_rules(ses):
+    name = f"rs-{_uuid_mod.uuid4().hex[:8]}"
+    ses.create_receipt_rule_set(RuleSetName=name)
+    with pytest.raises(ClientError) as exc:
+        ses.create_receipt_rule_set(RuleSetName=name)
+    assert exc.value.response["Error"]["Code"] == "AlreadyExists"
+    assert exc.value.response["Error"]["Message"] == f"Rule set already exists: {name}"
+    try:
+        ses.create_receipt_rule(RuleSetName=name, Rule={
+            "Name": "store", "Enabled": True, "ScanEnabled": True, "TlsPolicy": "Require",
+            "Recipients": ["inbox@example.com"],
+            "Actions": [{"S3Action": {"BucketName": "b", "ObjectKeyPrefix": "in/"}},
+                        {"StopAction": {"Scope": "RuleSet"}}]})
+        # No After puts a rule first; After places it behind the named rule.
+        ses.create_receipt_rule(RuleSetName=name, Rule={"Name": "first"})
+        ses.create_receipt_rule(RuleSetName=name, After="store", Rule={"Name": "last"})
+        rules = ses.describe_receipt_rule_set(RuleSetName=name)["Rules"]
+        assert [r["Name"] for r in rules] == ["first", "store", "last"]
+        assert ses.describe_receipt_rule(RuleSetName=name, RuleName="store")["Rule"] == {
+            "Name": "store", "Enabled": True, "ScanEnabled": True, "TlsPolicy": "Require",
+            "Recipients": ["inbox@example.com"],
+            "Actions": [{"S3Action": {"BucketName": "b", "ObjectKeyPrefix": "in/"}},
+                        {"StopAction": {"Scope": "RuleSet"}}]}
+        assert ses.describe_receipt_rule(RuleSetName=name, RuleName="first")["Rule"] == {
+            "Name": "first", "Enabled": False, "ScanEnabled": False, "TlsPolicy": "Optional"}
+
+        ses.update_receipt_rule(RuleSetName=name, Rule={"Name": "first", "Enabled": True})
+        assert ses.describe_receipt_rule(RuleSetName=name, RuleName="first")["Rule"]["Enabled"] is True
+        ses.set_receipt_rule_position(RuleSetName=name, RuleName="first", After="last")
+        rules = ses.describe_receipt_rule_set(RuleSetName=name)["Rules"]
+        assert [r["Name"] for r in rules] == ["store", "last", "first"]
+
+        with pytest.raises(ClientError) as exc:
+            ses.describe_receipt_rule(RuleSetName=name, RuleName="missing")
+        assert exc.value.response["Error"]["Code"] == "RuleDoesNotExist"
+        with pytest.raises(ClientError) as exc:
+            ses.describe_receipt_rule_set(RuleSetName=f"{name}-missing")
+        assert exc.value.response["Error"]["Message"] == f"Rule set does not exist: {name}-missing"
+
+        ses.set_active_receipt_rule_set(RuleSetName=name)
+        assert ses.describe_active_receipt_rule_set()["Metadata"]["Name"] == name
+        with pytest.raises(ClientError) as exc:
+            ses.delete_receipt_rule_set(RuleSetName=name)
+        assert exc.value.response["Error"]["Code"] == "CannotDelete"
+        ses.set_active_receipt_rule_set()
+        assert "Metadata" not in ses.describe_active_receipt_rule_set()
+        ses.delete_receipt_rule(RuleSetName=name, RuleName="last")
+        rules = ses.describe_receipt_rule_set(RuleSetName=name)["Rules"]
+        assert [r["Name"] for r in rules] == ["store", "first"]
+    finally:
+        ses.set_active_receipt_rule_set()
+        ses.delete_receipt_rule_set(RuleSetName=name)

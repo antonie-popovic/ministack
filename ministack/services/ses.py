@@ -56,6 +56,10 @@ _templates = AccountRegionScopedDict()
 _configuration_sets = AccountRegionScopedDict()
 # SESv2 PutAccountDetails, under "account": ProductionAccessEnabled and the details.
 _account_details = AccountRegionScopedDict()
+# Receipt rule sets by name ({"Name", "CreatedTimestamp", "Rules": [rule]}),
+# and the active set's name under "active".
+_receipt_rule_sets = AccountRegionScopedDict()
+_active_receipt_rule_set = AccountRegionScopedDict()
 _SIMULATOR_DOMAIN = "simulator.amazonses.com"
 
 
@@ -77,6 +81,8 @@ def get_state() -> dict:
         "_templates": _templates,
         "_configuration_sets": _configuration_sets,
         "_account_details": _account_details,
+        "_receipt_rule_sets": _receipt_rule_sets,
+        "_active_receipt_rule_set": _active_receipt_rule_set,
     })
 
 
@@ -91,6 +97,8 @@ def _restore_state(data: dict):
         _configuration_sets, data.get("_configuration_sets", {})
     )
     _restore_regional_store(_account_details, data.get("_account_details", {}))
+    _restore_regional_store(_receipt_rule_sets, data.get("_receipt_rule_sets", {}))
+    _restore_regional_store(_active_receipt_rule_set, data.get("_active_receipt_rule_set", {}))
 
 
 def _restore_regional_store(store, restored):
@@ -157,6 +165,16 @@ async def handle_request(method, path, headers, body, query_params):
         "GetIdentityDkimAttributes": _get_identity_dkim_attributes,
         "SetIdentityNotificationTopic": _set_identity_notification_topic,
         "SetIdentityFeedbackForwardingEnabled": _set_identity_feedback_forwarding,
+        "CreateReceiptRuleSet": _create_receipt_rule_set,
+        "DeleteReceiptRuleSet": _delete_receipt_rule_set,
+        "DescribeReceiptRuleSet": _describe_receipt_rule_set,
+        "SetActiveReceiptRuleSet": _set_active_receipt_rule_set,
+        "DescribeActiveReceiptRuleSet": _describe_active_receipt_rule_set,
+        "CreateReceiptRule": _create_receipt_rule,
+        "UpdateReceiptRule": _update_receipt_rule,
+        "DeleteReceiptRule": _delete_receipt_rule,
+        "DescribeReceiptRule": _describe_receipt_rule,
+        "SetReceiptRulePosition": _set_receipt_rule_position,
     }
 
     handler = handlers.get(action)
@@ -643,6 +661,189 @@ def _list_configuration_sets(params):
 
 
 # ---------------------------------------------------------------------------
+# v1 — Receipt rule sets and rules (stored; inbound mail is not received)
+# ---------------------------------------------------------------------------
+
+def _rule_set_missing(name):
+    return _error("RuleSetDoesNotExist", f"Rule set does not exist: {name}", 400)
+
+
+def _rule_missing(name):
+    return _error("RuleDoesNotExist", f"Rule does not exist: {name}", 400)
+
+
+def _parse_query_tree(params, prefix):
+    """Query parameters under ``prefix`` as nested dicts, ``member.N`` as lists."""
+    tree = {}
+    for key in params:
+        if not key.startswith(prefix):
+            continue
+        node, parts = tree, key[len(prefix):].split(".")
+        for i, part in enumerate(parts):
+            last = i == len(parts) - 1
+            if part == "member" and not last:
+                node = node.setdefault("__list__", {})
+                continue
+            if last:
+                node[part] = _p(params, key)
+            else:
+                node = node.setdefault(part, {})
+    return _lists_from_tree(tree)
+
+
+def _lists_from_tree(node):
+    if not isinstance(node, dict):
+        return node
+    if "__list__" in node:
+        items = node["__list__"]
+        return [_lists_from_tree(items[k]) for k in sorted(items, key=int)]
+    return {k: _lists_from_tree(v) for k, v in node.items()}
+
+
+def _tree_xml(value):
+    if isinstance(value, list):
+        return "".join(f"<member>{_tree_xml(v)}</member>" for v in value)
+    if isinstance(value, dict):
+        return "".join(f"<{k}>{_tree_xml(v)}</{k}>" for k, v in value.items())
+    return _esc(str(value))
+
+
+def _receipt_rule_from_params(params):
+    rule = _parse_query_tree(params, "Rule.")
+    rule.setdefault("Enabled", "false")
+    rule.setdefault("TlsPolicy", "Optional")
+    rule.setdefault("ScanEnabled", "false")
+    return rule
+
+
+def _rule_set_xml(rule_set):
+    return (f"<Metadata><Name>{_esc(rule_set['Name'])}</Name>"
+            f"<CreatedTimestamp>{rule_set['CreatedTimestamp']}</CreatedTimestamp></Metadata>"
+            f"<Rules>{_tree_xml(rule_set['Rules'])}</Rules>")
+
+
+def _insert_rule(rules, rule, after):
+    if not after:
+        rules.insert(0, rule)
+        return None
+    index = next((i for i, r in enumerate(rules) if r["Name"] == after), None)
+    if index is None:
+        return _rule_missing(after)
+    rules.insert(index + 1, rule)
+    return None
+
+
+def _create_receipt_rule_set(params):
+    name = _p(params, "RuleSetName")
+    if name in _receipt_rule_sets:
+        return _error("AlreadyExists", f"Rule set already exists: {name}", 400)
+    _receipt_rule_sets[name] = {"Name": name, "CreatedTimestamp": _iso_now(), "Rules": []}
+    return _xml(200, "CreateReceiptRuleSetResponse", "<CreateReceiptRuleSetResult/>")
+
+
+def _delete_receipt_rule_set(params):
+    name = _p(params, "RuleSetName")
+    if name and _active_receipt_rule_set.get("active") == name:
+        return _error("CannotDelete", f"Cannot delete active rule set: {name}", 400)
+    _receipt_rule_sets.pop(name, None)
+    return _xml(200, "DeleteReceiptRuleSetResponse", "<DeleteReceiptRuleSetResult/>")
+
+
+def _describe_receipt_rule_set(params):
+    name = _p(params, "RuleSetName")
+    rule_set = _receipt_rule_sets.get(name)
+    if rule_set is None:
+        return _rule_set_missing(name)
+    return _xml(200, "DescribeReceiptRuleSetResponse",
+                f"<DescribeReceiptRuleSetResult>{_rule_set_xml(rule_set)}</DescribeReceiptRuleSetResult>")
+
+
+def _set_active_receipt_rule_set(params):
+    name = _p(params, "RuleSetName")
+    if not name:
+        _active_receipt_rule_set.pop("active", None)
+    elif name not in _receipt_rule_sets:
+        return _rule_set_missing(name)
+    else:
+        _active_receipt_rule_set["active"] = name
+    return _xml(200, "SetActiveReceiptRuleSetResponse", "<SetActiveReceiptRuleSetResult/>")
+
+
+def _describe_active_receipt_rule_set(params):
+    rule_set = _receipt_rule_sets.get(_active_receipt_rule_set.get("active") or "")
+    inner = _rule_set_xml(rule_set) if rule_set else ""
+    return _xml(200, "DescribeActiveReceiptRuleSetResponse",
+                f"<DescribeActiveReceiptRuleSetResult>{inner}</DescribeActiveReceiptRuleSetResult>")
+
+
+def _create_receipt_rule(params):
+    rule_set_name = _p(params, "RuleSetName")
+    rule_set = _receipt_rule_sets.get(rule_set_name)
+    if rule_set is None:
+        return _rule_set_missing(rule_set_name)
+    rule = _receipt_rule_from_params(params)
+    if any(r["Name"] == rule.get("Name") for r in rule_set["Rules"]):
+        return _error("AlreadyExists", f"Rule already exists: {rule.get('Name')}", 400)
+    err = _insert_rule(rule_set["Rules"], rule, _p(params, "After"))
+    if err:
+        return err
+    return _xml(200, "CreateReceiptRuleResponse", "<CreateReceiptRuleResult/>")
+
+
+def _update_receipt_rule(params):
+    rule_set_name = _p(params, "RuleSetName")
+    rule_set = _receipt_rule_sets.get(rule_set_name)
+    if rule_set is None:
+        return _rule_set_missing(rule_set_name)
+    rule = _receipt_rule_from_params(params)
+    index = next((i for i, r in enumerate(rule_set["Rules"]) if r["Name"] == rule.get("Name")), None)
+    if index is None:
+        return _rule_missing(rule.get("Name"))
+    rule_set["Rules"][index] = rule
+    return _xml(200, "UpdateReceiptRuleResponse", "<UpdateReceiptRuleResult/>")
+
+
+def _delete_receipt_rule(params):
+    rule_set_name = _p(params, "RuleSetName")
+    rule_set = _receipt_rule_sets.get(rule_set_name)
+    if rule_set is None:
+        return _rule_set_missing(rule_set_name)
+    name = _p(params, "RuleName")
+    rule_set["Rules"] = [r for r in rule_set["Rules"] if r["Name"] != name]
+    return _xml(200, "DeleteReceiptRuleResponse", "<DeleteReceiptRuleResult/>")
+
+
+def _describe_receipt_rule(params):
+    rule_set_name = _p(params, "RuleSetName")
+    rule_set = _receipt_rule_sets.get(rule_set_name)
+    if rule_set is None:
+        return _rule_set_missing(rule_set_name)
+    name = _p(params, "RuleName")
+    rule = next((r for r in rule_set["Rules"] if r["Name"] == name), None)
+    if rule is None:
+        return _rule_missing(name)
+    return _xml(200, "DescribeReceiptRuleResponse",
+                f"<DescribeReceiptRuleResult><Rule>{_tree_xml(rule)}</Rule></DescribeReceiptRuleResult>")
+
+
+def _set_receipt_rule_position(params):
+    rule_set_name = _p(params, "RuleSetName")
+    rule_set = _receipt_rule_sets.get(rule_set_name)
+    if rule_set is None:
+        return _rule_set_missing(rule_set_name)
+    name = _p(params, "RuleName")
+    rule = next((r for r in rule_set["Rules"] if r["Name"] == name), None)
+    if rule is None:
+        return _rule_missing(name)
+    remaining = [r for r in rule_set["Rules"] if r["Name"] != name]
+    err = _insert_rule(remaining, rule, _p(params, "After"))
+    if err:
+        return err
+    rule_set["Rules"] = remaining
+    return _xml(200, "SetReceiptRulePositionResponse", "<SetReceiptRulePositionResult/>")
+
+
+# ---------------------------------------------------------------------------
 # v1 — Templates
 # ---------------------------------------------------------------------------
 
@@ -959,3 +1160,5 @@ def reset():
     _templates.clear()
     _configuration_sets.clear()
     _account_details.clear()
+    _receipt_rule_sets.clear()
+    _active_receipt_rule_set.clear()

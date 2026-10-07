@@ -52,6 +52,9 @@ TEMPLATE_PAGE_SIZE = 10  # ListEmailTemplates default per the AWS API reference
 _identities = AccountRegionScopedDict()  # identity -> dict
 _config_sets = AccountRegionScopedDict()  # name -> dict
 _ses_tags = AccountRegionScopedDict()  # resource_arn -> [tags]
+_dedicated_ip_pools = AccountRegionScopedDict()  # pool name -> {"PoolName", "ScalingMode"}
+_tenants = AccountRegionScopedDict()  # tenant name -> tenant record
+_tenant_resources = AccountRegionScopedDict()  # tenant name -> [{"ResourceType", "ResourceArn"}]
 
 
 def get_state() -> dict:
@@ -59,6 +62,9 @@ def get_state() -> dict:
         "_identities": _identities,
         "_config_sets": _config_sets,
         "_ses_tags": _ses_tags,
+        "_dedicated_ip_pools": _dedicated_ip_pools,
+        "_tenants": _tenants,
+        "_tenant_resources": _tenant_resources,
     })
 
 
@@ -70,6 +76,9 @@ def _restore_state(data: dict):
     _restore_regional_store(_identities, data.get("_identities", {}))
     _restore_regional_store(_config_sets, data.get("_config_sets", {}))
     _restore_tag_store(data.get("_ses_tags", {}))
+    _restore_regional_store(_dedicated_ip_pools, data.get("_dedicated_ip_pools", {}))
+    _restore_regional_store(_tenants, data.get("_tenants", {}))
+    _restore_regional_store(_tenant_resources, data.get("_tenant_resources", {}))
 
 
 def _restore_tag_store(restored):
@@ -282,6 +291,12 @@ def _local_ses_v2_resource_arn(arn):
         return None, _invalid_resource_arn(arn)
 
     kind, sep, name = spec.resource.partition("/")
+    if kind == "tenant":
+        # arn:...:tenant/{TenantName}/{TenantId}
+        tenant = _tenants.get(name.split("/", 1)[0])
+        if not tenant or tenant["TenantArn"] != str(spec):
+            return None, _not_found_resource_arn(arn)
+        return str(spec), None
     if sep != "/" or not name or "/" in name:
         return None, _invalid_resource_arn(arn)
 
@@ -291,10 +306,33 @@ def _local_ses_v2_resource_arn(arn):
     elif kind == "configuration-set":
         if name not in _config_sets:
             return None, _not_found_resource_arn(arn)
+    elif kind == "dedicated-ip-pool":
+        if name not in _dedicated_ip_pools:
+            return None, _not_found_resource_arn(arn)
     else:
         return None, _invalid_resource_arn(arn)
 
     return str(spec), None
+
+
+def _tenant_resource_type(resource_arn):
+    """ResourceType of an identity, configuration set or template ARN in this
+    account and region, or a NotFoundException."""
+    try:
+        spec = parse_arn(resource_arn)
+    except (ArnParseError, TypeError):
+        return None, _invalid_resource_arn(resource_arn)
+    kind, _, name = spec.resource.partition("/")
+    stores = {"identity": (_identities, "EMAIL_IDENTITY"),
+              "configuration-set": (_config_sets, "CONFIGURATION_SET"),
+              "template": (_templates, "EMAIL_TEMPLATE")}
+    if (kind not in stores or spec.service != "ses" or spec.account_id != get_account_id()
+            or spec.region != get_region()):
+        return None, _invalid_resource_arn(resource_arn)
+    store, resource_type = stores[kind]
+    if name not in store:
+        return None, _not_found_resource_arn(resource_arn)
+    return resource_type, None
 
 
 async def handle_request(method, path, headers, body, query_params):
@@ -656,6 +694,90 @@ async def handle_request(method, path, headers, body, query_params):
             _templates.pop(name, None)
             return json_response({})
 
+    # Dedicated IP pools: POST /dedicated-ip-pools, GET/DELETE /dedicated-ip-pools/{PoolName}
+    if sub == "/dedicated-ip-pools" and method == "POST":
+        name = data.get("PoolName", "")
+        if not name:
+            return _json_err("BadRequestException", "PoolName is required")
+        if name in _dedicated_ip_pools:
+            return _json_err("AlreadyExistsException", f"Dedicated IP pool {name} already exists")
+        _dedicated_ip_pools[name] = {"PoolName": name, "ScalingMode": data.get("ScalingMode") or "STANDARD"}
+        _ses_tags[_resource_arn("dedicated-ip-pool", name)] = list(data.get("Tags", []))
+        return json_response({})
+    m = re.match(r"^/dedicated-ip-pools/([^/]+)$", sub)
+    if m and method in ("GET", "DELETE"):
+        name = m.group(1)
+        pool = _dedicated_ip_pools.get(name)
+        if not pool:
+            return _json_err("NotFoundException", f"Dedicated IP pool {name} not found", 404)
+        if method == "GET":
+            return json_response({"DedicatedIpPool": pool})
+        _dedicated_ip_pools.pop(name, None)
+        _ses_tags.pop(_resource_arn("dedicated-ip-pool", name), None)
+        return json_response({})
+
+    # Tenants: POST /tenants (Create), /tenants/get, /tenants/delete,
+    # /tenants/resources (associate), /tenants/resources/delete, /tenants/resources/list
+    if sub.startswith("/tenants") and method == "POST":
+        name = data.get("TenantName", "")
+        if not name:
+            return _json_err("BadRequestException", "TenantName is required")
+        if sub == "/tenants":
+            if name in _tenants:
+                return _json_err("AlreadyExistsException", f"Tenant {name} already exists")
+            tenant_id = "tn-" + new_uuid().replace("-", "")[:28]
+            tenant = {
+                "TenantName": name,
+                "TenantId": tenant_id,
+                "TenantArn": f"{_resource_arn('tenant', name)}/{tenant_id}",
+                "CreatedTimestamp": int(time.time()),
+                "SendingStatus": "ENABLED",
+            }
+            if data.get("SuppressionAttributes"):
+                tenant["SuppressionAttributes"] = data["SuppressionAttributes"]
+            _tenants[name] = tenant
+            _ses_tags[tenant["TenantArn"]] = list(data.get("Tags", []))
+            return json_response({**tenant, "Tags": _ses_tags[tenant["TenantArn"]]})
+        tenant = _tenants.get(name)
+        if not tenant:
+            return _json_err("NotFoundException", f"Tenant {name} not found", 404)
+        if sub == "/tenants/get":
+            return json_response({"Tenant": {**tenant, "Tags": _ses_tags.get(tenant["TenantArn"], [])}})
+        if sub == "/tenants/delete":
+            _tenants.pop(name, None)
+            _tenant_resources.pop(name, None)
+            _ses_tags.pop(tenant["TenantArn"], None)
+            return json_response({})
+        resources = _tenant_resources.get(name) or []
+        if sub == "/tenants/resources/list":
+            wanted = (data.get("Filter") or {}).get("RESOURCE_TYPE")
+            items = [r for r in resources if not wanted or r["ResourceType"] == wanted]
+            page, next_token, err = _paginate(items, _body_paging(data), 100, maximum=1000)
+            if err:
+                return err
+            out = {"TenantResources": page}
+            if next_token:
+                out["NextToken"] = next_token
+            return json_response(out)
+        resource_arn = data.get("ResourceArn", "")
+        if not resource_arn:
+            return _json_err("BadRequestException", "ResourceArn is required")
+        if sub == "/tenants/resources":
+            resource_type, err = _tenant_resource_type(resource_arn)
+            if err:
+                return err
+            if any(r["ResourceArn"] == resource_arn for r in resources):
+                return _json_err("AlreadyExistsException",
+                                 f"Resource {resource_arn} is already associated with tenant {name}")
+            _tenant_resources[name] = resources + [{"ResourceType": resource_type, "ResourceArn": resource_arn}]
+            return json_response({})
+        if sub == "/tenants/resources/delete":
+            remaining = [r for r in resources if r["ResourceArn"] != resource_arn]
+            if len(remaining) == len(resources):
+                return _not_found_resource_arn(resource_arn)
+            _tenant_resources[name] = remaining
+            return json_response({})
+
     # GET/POST/DELETE /v2/email/tags  (ListTagsForResource / TagResource / UntagResource)
     if sub == "/tags" and method == "GET":
         arn = _first_query_value(query_params, "ResourceArn")
@@ -692,3 +814,6 @@ def reset():
     _identities.clear()
     _config_sets.clear()
     _ses_tags.clear()
+    _dedicated_ip_pools.clear()
+    _tenants.clear()
+    _tenant_resources.clear()

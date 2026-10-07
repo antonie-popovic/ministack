@@ -7,6 +7,11 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **SES — receipt rule sets and rules** — `CreateReceiptRuleSet`, `DeleteReceiptRuleSet`, `DescribeReceiptRuleSet`, `SetActiveReceiptRuleSet`, `DescribeActiveReceiptRuleSet`, `CreateReceiptRule`, `UpdateReceiptRule`, `DeleteReceiptRule`, `DescribeReceiptRule` and `SetReceiptRulePosition`. Rules keep their order (`After`, or first when omitted), recipients, actions and the `Enabled` / `ScanEnabled` / `TlsPolicy` defaults; the active rule set cannot be deleted (`CannotDelete`), and a missing set answers `RuleSetDoesNotExist` "Rule set does not exist: <name>". Rules are stored only: no inbound mail is received and no action runs. Reported by @wparad.
+- **SES v2 — dedicated IP pools and tenants** — `CreateDedicatedIpPool`, `GetDedicatedIpPool`, `DeleteDedicatedIpPool`, `CreateTenant`, `GetTenant`, `DeleteTenant`, `CreateTenantResourceAssociation`, `DeleteTenantResourceAssociation` and `ListTenantResources` (filtered by `RESOURCE_TYPE`); a tenant gets a `tn-` id and an `arn:aws:ses:<region>:<account>:tenant/<name>/<id>` ARN, and pools and tenants take tags through `TagResource` / `ListTagsForResource`, so the Terraform `aws_sesv2_dedicated_ip_pool`, `aws_sesv2_tenant` and `aws_sesv2_tenant_resource_association` resources apply, plan clean and destroy. No IPs are allocated to a pool. Reported by @wparad.
+
 ### Fixed
 
 - **Kinesis — active subscriptions survive retention pruning** — `SubscribeToShard` tracks its selected sequence boundary instead of a record-list offset, so removing expired records cannot skip newly appended records. The starting boundary and checkpoint are captured before streaming begins and progress remains stable through idle polls and repeated pruning. Contributed by @AdrianAcala.
