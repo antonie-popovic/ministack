@@ -503,29 +503,6 @@ def _resolve_port():
     return os.environ.get("GATEWAY_PORT") or os.environ.get("EDGE_PORT") or "4566"
 
 
-def _configure_tls(config, bind_host: str, port: str) -> None:
-    """USE_SSL=1 serves the gateway over TLS (cert auto-generated under TMPDIR,
-    or BYO via MINISTACK_SSL_CERT + MINISTACK_SSL_KEY). A Cognito token's `iss`
-    is https with no port, so clients ask 443: under USE_SSL the gateway listens
-    there too, and in a container 443 serves TLS for in-process Lambdas even
-    while the gateway itself stays plain HTTP.
-    """
-    from ministack.core import tls as _tls
-    from ministack.services.lambda_svc import _running_in_container
-
-    if _tls.use_ssl_enabled():
-        config.certfile, config.keyfile = _tls.resolve_tls_material()
-        if port != "443" and _port_is_bindable(bind_host, 443):
-            config.bind.append(f"{bind_host}:443")
-    elif _running_in_container() and port != "443" and _port_is_bindable(bind_host, 443):
-        config.certfile, config.keyfile = _tls.resolve_tls_material()
-        config.insecure_bind, config.bind = config.bind, [f"{bind_host}:443"]
-        _tls.issuer_listener = True
-    # In-process Lambdas share this container's resolver; Docker ones get extra_hosts.
-    if _running_in_container():
-        _tls.map_cognito_issuer_hosts()
-
-
 def _port_is_bindable(host: str, port: int) -> bool:
     """Whether `port` can be opened here: free, and permitted to this process."""
     import socket as _socket
@@ -3407,19 +3384,24 @@ def main():
         config.keep_alive_timeout = 75
         config.loglevel = LOG_LEVEL.upper()
 
-        _configure_tls(config, bind_host, port)
+        # USE_SSL=1 enables HTTPS — matches the behaviour previously provided
+        # by ministack/core/hypercorn_conf.py when the entrypoint was the
+        # hypercorn CLI. Self-signed cert auto-generated under TMPDIR, or BYO
+        # via MINISTACK_SSL_CERT + MINISTACK_SSL_KEY.
+        from ministack.core import tls as _tls
+
+        if _tls.use_ssl_enabled():
+            config.certfile, config.keyfile = _tls.resolve_tls_material()
+            # A Cognito token's `iss` is https with no port, so clients ask 443.
+            if port != "443" and _port_is_bindable(bind_host, 443):
+                config.bind.append(f"{bind_host}:443")
 
         try:
             asyncio.run(hypercorn_serve(app, config))
         except OSError:
-            if f"{bind_host}:443" not in config.bind or port == "443":
+            if len(config.bind) == 1:
                 raise
-            config.bind.remove(f"{bind_host}:443")
-            if not config.bind:  # A plain gateway keeps serving without the issuer listener.
-                config.bind, config.insecure_bind, config.certfile = config.insecure_bind, [], None
-                from ministack.core import tls as _tls
-
-                _tls.issuer_listener = False
+            config.bind = config.bind[:1]
             logger.warning("Port 443 became unavailable; serving on %s only",
                            config.bind[0])
             asyncio.run(hypercorn_serve(app, config))

@@ -19,7 +19,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- **Lambda — in-process functions reach the Cognito issuer** — a function MiniStack runs in its own container (`provided.*` bootstraps, the warm workers, the one-shot subprocess) resolved `cognito-idp.<region>.amazonaws.com` to AWS, so OIDC discovery for a local pool answered `User pool ... does not exist.`; without `USE_SSL` nothing served the issuer's https at all. In a container MiniStack now maps the issuer hosts to itself and serves them over TLS on 443, also when `USE_SSL` is off (the gateway port then stays plain HTTP), and every in-process executor trusts that certificate whatever `AWS_ENDPOINT_URL` the function sets, `SSL_CERT_FILE` included. The generated certificate is a server certificate (`CA:FALSE`, `serverAuth`), since rustls refused the former CA certificate as `CaUsedAsEndEntity`; a cached CA certificate is regenerated.
+- **TLS — the generated certificate works with rustls** — it was a CA certificate, which rustls refuses as a server's (`CaUsedAsEndEntity`). It is now a server certificate (`CA:FALSE`, `serverAuth`), and a cached CA certificate is regenerated.
 - **Lambda — preserve invocation aliases in runtime context** — `Invoke` retains the requested alias or version in `invoked_function_arn`, while `function_version` remains the resolved published version. Warm workers receive invocation identity per request. Contributed by @jayjanssen.
 - **IoT — `DescribeCertificate` reports `certificateMode`** — the field was missing from the description. It is now `SNI_ONLY` for a certificate registered with `RegisterCertificateWithoutCA` and `DEFAULT` for the others, as AWS reports it. Contributed by @iot-rocket.
 ### Fixed

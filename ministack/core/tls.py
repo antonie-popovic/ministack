@@ -134,31 +134,8 @@ def _cert_names(cert_path: str, names: "list[str]") -> bool:
     return all(f"DNS:{name}" in text for name in names) and "CA:TRUE" not in text
 
 
-def map_cognito_issuer_hosts(hosts_path: str = "/etc/hosts") -> None:
-    """Resolve every Cognito issuer host to this container's gateway, for in-process Lambdas."""
-    try:
-        present = open(hosts_path, encoding="utf-8").read().split()
-        missing = [host for host in cognito_idp_hosts() if host not in present]
-        if missing:
-            with open(hosts_path, "a", encoding="utf-8") as hosts:
-                hosts.write("".join(f"127.0.0.1 {host}\n" for host in missing))
-    except OSError:
-        pass
-
-
-# Set by app._configure_tls while 443 serves the Cognito issuer next to a plain-HTTP gateway.
-issuer_listener = False
-
-
-def issuer_tls_enabled() -> bool:
-    """Whether the gateway serves TLS: under USE_SSL, or on the 443 issuer listener."""
-    return use_ssl_enabled() or issuer_listener
-
-
 def trust_gateway_cert(env: dict) -> None:
     """Have a host process trust the gateway's certificate, unless env already names a CA."""
-    if not issuer_tls_enabled():
-        return
     try:
         cert_path, _key_path = resolve_tls_material()
     except SystemExit:
@@ -168,7 +145,7 @@ def trust_gateway_cert(env: dict) -> None:
     env.setdefault("NODE_EXTRA_CA_CERTS", cert_path)
     bundle = ca_bundle_path(cert_path)
     if bundle:
-        for var in ("AWS_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "SSL_CERT_FILE"):
+        for var in ("AWS_CA_BUNDLE", "REQUESTS_CA_BUNDLE"):
             env.setdefault(var, bundle)
 
 
